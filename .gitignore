@@ -1,0 +1,24 @@
+# training artefacts - checkpoints are multi-GB, never commit
+logs/
+outputs/
+configs/_resolved/
+*.ckpt
+*.pt
+*.pth
+
+# datasets (only examples/ is tracked)
+# dataset dir at the repo ROOT only -- a bare "data/" would also match ldm/data/,
+# which is source code, and silently exclude the dataset loaders from the release.
+/data/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# editors / tooling
+.vscode/
+.idea/
+.DS_Store
+.omc/

@@ -1,0 +1,230 @@
+# ---------------------------------------------------------------------------
+# DiffTV stage 3: ControlNet refinement, "Variant S" (hint = the thermal image).
+# Implements _setup/design/controlnet_design.md section 5.3.
+#
+# WHAT THIS STAGE DOES
+#   Stage 2 (configs/difftv/ldm_cond.yaml) trained a LatentDiffusion UNet that
+#   predicts eps in the 4x16x16 VQ latent, conditioned on the thermal latent by
+#   CONCATENATION (UNet in_channels = 4 + 4 = 8). Stage 3 freezes that UNet and
+#   trains a ControlNet: a trainable copy of its encoder + middle block whose
+#   outputs are pushed back into the frozen decoder through zero-initialised
+#   1x1 convs.
+#
+#   The paper's stage-3 hint is the ArcFace-T identity embedding (Table 1,
+#   variant E). ArcFace-T does not exist in this repo (design doc section 0),
+#   so this config uses the THERMAL IMAGE as the hint. That is "Variant S": it
+#   validates the plumbing and has NO paper reference number. Judge it only
+#   against the stage-2 baseline (variant A: FID 35.58 / LPIPS 0.1750 /
+#   PSNR 29.19 / SSIM 0.7082).
+#
+# EVERY CHOICE BELOW, AND WHY
+#   * target ControlLDM, not LatentDiffusion: adds control_model, routes
+#     cond['c_control'] into it and cond['c_concat'] into the UNet concat.
+#   * unet_config.target ControlledUnetModel: same module tree / same
+#     state_dict keys as UNetModel, only `forward` differs (it accepts and pops
+#     the control residuals). A stage-2 checkpoint therefore loads verbatim.
+#   * All of linear_start / linear_end / timesteps / num_timesteps_cond /
+#     log_every_t / image_size / channels / first_stage_key / cond_stage_key
+#     are byte-identical to configs/difftv/ldm_cond.yaml. If any of them drift,
+#     the diffusion schedule buffers in the stage-2 checkpoint no longer match
+#     the ones registered here and the model silently denoises with the wrong
+#     betas.
+#   * image_size 16 / channels 4: 128px input, VQ f=8, embed_dim 4 -> the
+#     latent is 4x16x16. (Same correction the stage-2 config documents.)
+#   * concat_mode true -> conditioning_key 'concat'. ControlLDM asserts this.
+#   * cond_stage_trainable false: TH_Encoder is pretrained in stage 1b and must
+#     stay frozen. configure_optimizers raises if this is ever set true.
+#   * use_ema FALSE. LitEma shadows self.model, which ControlLDM freezes
+#     wholesale, so an EMA would track nothing. (Design doc 4.5.)
+#   * control_key th_img: Variant S reuses the thermal image already present in
+#     every batch from DatasetT2VLDM. It arrives as (B,128,128,3), BGR, in
+#     [-1,1]; get_input permutes it to (B,3,128,128). Range/channel order do
+#     not matter because input_hint_block's first conv is trained from scratch,
+#     but train and test must stay consistent -- so nothing in the loader
+#     changes.
+#   * only_mid_control false: use all 13 residuals (12 skip + 1 middle). True
+#     would compute the 12 skip residuals and throw them away.
+#   * sd_locked true: train ONLY the ControlNet. The paper says "fine-tune the
+#     trained model in the final stage", which reads as ControlNet-only; the
+#     alternative (unlock output_blocks + out) is an untested second run.
+#     UNCERTAIN -- design doc section 7, open question 4.
+#   * base_learning_rate 1.0e-05: ControlNet's own convention. The paper's
+#     2.0e-06 is the stage-2 LDM rate. UNCERTAIN -- design doc section 7,
+#     open question 3. main.py multiplies this by
+#     accumulate_grad_batches * n_gpus * batch_size when --scale_lr is on.
+#   * ckpt_path: produced by tools/tool_add_control_difftv.py from the stage-2
+#     checkpoint. ControlLDM pops ckpt_path BEFORE super().__init__ and loads
+#     it only after control_model exists, so control_model.* is NOT silently
+#     dropped (design doc 6.5). Left as a placeholder because stage 2 has not
+#     finished training.
+#
+#   control_stage_config
+#   * in_channels 8 == the base UNet's in_channels. ControlNet is fed the exact
+#     same cat([z_t, c_th]) tensor the frozen UNet sees (design doc 4.2). With
+#     4 the stem-weight copy in tool_add_control_difftv.py would shape-mismatch
+#     and the stem would be random-initialised.
+#   * hint_channels 3: an RGB/BGR 128x128 image.
+#   * model_channels / attention_resolutions / num_res_blocks / channel_mult /
+#     num_head_channels are copied EXACTLY from unet_config. If they differ, the
+#     residual channel ladder diverges from the decoder skips and either the
+#     add shape-fails or (worse) the init tool reports encoder weights as
+#     "newly initialised".
+#   * use_spatial_transformer false, context_dim unset: DiffTV's
+#     SpatialTransformer is a bespoke rewrite with an incompatible signature
+#     that asserts context is not None. ControlNet raises NotImplementedError
+#     if either is enabled (design doc D6). DiffTV has no cross-attention.
+#   * use_checkpoint false: AttentionBlock hard-codes gradient checkpointing on
+#     regardless of this flag, and DiffTV's CheckpointFunction does not capture
+#     autocast state -- so combine it with AMP only after patching it
+#     (design doc 6.8). Train this stage at precision 32.
+#   * use_fp16 is left unset (False) on BOTH branches; the residual add would
+#     otherwise mix dtypes (design doc D8).
+#   * The 13 residuals (12 zero_convs + 1 middle_block_out) are DERIVED at
+#     runtime from the built module tree and asserted, never hardcoded.
+#
+#   first_stage_config / cond_stage_config are copied verbatim from
+#   configs/difftv/ldm_cond.yaml, including ddconfig resolution 128 and
+#   attn_resolutions [16], which must match configs/difftv/vq_vis.yaml and
+#   configs/difftv/vq_th.yaml exactly or init_from_ckpt (strict=False) silently
+#   drops the attention weights.
+#
+#   gpus "0,1,2" as a STRING: main.py does str(gpuinfo).strip(",").split(",").
+#   batch_size 14 x 3 gpus = global batch 42, the paper's batch size.
+#   strategy ddp: safe here because ControlLDM calls
+#   self.model.requires_grad_(False), so no parameter is left with
+#   requires_grad=True but no gradient (design doc 6.10).
+# ---------------------------------------------------------------------------
+save_test_dir: outputs/cldm_variant_s/test_images
+
+model:
+  # main.py applies --scale_lr by DEFAULT: lr = accumulate * ngpu * batch_size * base_lr
+  #   = 1 * 3 * 14 * base_lr = 42 * base_lr.
+  # ControlNet's convention is an ACTUAL AdamW lr of 1e-5, so base_lr must be 1e-5/42.
+  # (Setting base_learning_rate: 1.0e-05 here would silently train at 4.2e-4, 42x too high.)
+  base_learning_rate: 2.380952e-07   # * 42 = 1.0e-05 effective
+  target: cldm_difftv.cldm.ControlLDM
+  params:
+    # --- must byte-match configs/difftv/ldm_cond.yaml -------------------
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: vis_img
+    cond_stage_key: th_img
+    image_size: 16          # latent spatial size (128 / 8)
+    channels: 4             # latent channels (= embed_dim)
+    concat_mode: true       # -> conditioning_key 'concat'
+    cond_stage_trainable: false
+    monitor: val/loss_simple_ema
+    # -------------------------------------------------------------------
+    use_ema: false          # LitEma would shadow the frozen base UNet only
+    control_key: th_img     # Variant S hint: the thermal image itself
+    only_mid_control: false
+    sd_locked: true         # train the ControlNet only
+    ckpt_path: __CLDM_INIT_CKPT__   # output of tools/tool_add_control_difftv.py
+
+    control_stage_config:
+      target: cldm_difftv.cldm.ControlNet
+      params:
+        image_size: 16
+        in_channels: 8      # == unet_config.in_channels (design doc 4.2)
+        hint_channels: 3    # thermal image, 3 channels
+        model_channels: 224
+        attention_resolutions: [8, 4, 2]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 3, 4]
+        num_head_channels: 32
+        use_spatial_transformer: false   # MUST stay false
+        use_checkpoint: false            # see design doc 6.8 before enabling
+
+    unet_config:
+      target: cldm_difftv.cldm.ControlledUnetModel
+      params:
+        image_size: 16
+        in_channels: 8      # 4 noisy latent + 4 thermal latent (concat)
+        out_channels: 4     # predicts eps in latent space
+        model_channels: 224
+        attention_resolutions: [8, 4, 2]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 3, 4]
+        num_head_channels: 32
+
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface
+      params:
+        embed_dim: 4
+        n_embed: 16384
+        ckpt_path: __STAGE1A_VIS_CKPT__
+        ddconfig:
+          double_z: false
+          z_channels: 4
+          resolution: 128
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 2, 4]
+          num_res_blocks: 2
+          attn_resolutions: [16]   # MUST match configs/difftv/vq_vis.yaml
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.th_encoder.TH_Encoder
+      params:
+        embed_dim: 4
+        n_embed: 16384
+        image_key: th_img
+        ckpt_path: __STAGE1B_TH_CKPT__   # thermal VQ-VAE; encoder.* + quant_conv.* are loaded
+        ddconfig:
+          double_z: false
+          z_channels: 4
+          resolution: 128
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 2, 4]
+          num_res_blocks: 2
+          attn_resolutions: [16]   # MUST match configs/difftv/vq_th.yaml
+          dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 14           # 14 x 3 gpus = global batch 42 (the paper's)
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/train/TH
+        vis_dir: data/thermal2visible_speakingfaces/train/VIS
+        in_size: 128
+    validation:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/test/TH
+        vis_dir: data/thermal2visible_speakingfaces/test/VIS
+        in_size: 128
+    test:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/test/TH
+        vis_dir: data/thermal2visible_speakingfaces/test/VIS
+        in_size: 128
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 5000
+        max_images: 8
+        increase_log_steps: false
+  trainer:
+    benchmark: true
+    gpus: "0,1,2"            # STRING: main.py calls .strip(",") on it
+    precision: 32            # NOT bf16 until CheckpointFunction is AMP-safe (6.8)
+    max_epochs: 300
+    check_val_every_n_epoch: 5

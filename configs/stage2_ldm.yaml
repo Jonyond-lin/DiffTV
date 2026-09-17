@@ -1,0 +1,136 @@
+# ---------------------------------------------------------------------------
+# DiffTV stage 2: latent diffusion UNet, thermal-conditioned (CONCAT conditioning).
+# First stage (VIS VQ-VAE) and conditional thermal encoder (TH VQ-VAE encoder) are FROZEN.
+# This is ablation variant "A" of the paper (Table 1): the plain LDM baseline,
+# reported there as FID 35.58 / LPIPS 0.1750 / PSNR 29.19 / SSIM 0.7082.
+#
+# Corrections vs the original configs/latent-diffusion/ldm_vq-4_cond.yaml:
+#   * params.channels 3 -> 4. The VQ latent has embed_dim=4 channels. With 3 the
+#     sampler allocated the wrong-shaped noise tensor.
+#   * params.image_size 64 -> 16. 128px input with f=8 gives a 16x16 latent
+#     (verified empirically: Encoder(128x128) -> (4,16,16)).
+#   * unet.out_channels 3 -> 4. The UNet predicts epsilon in LATENT space, so it
+#     must emit 4 channels, not 3.
+#   * unet.image_size 32 -> 16, for consistency.
+#   * unet.in_channels stays 8 = 4 (noisy latent) + 4 (thermal latent, concatenated).
+#   * first_stage_config.ddconfig attn_resolutions [] -> [16] and resolution 256 -> 128,
+#     so it is now IDENTICAL to the ddconfig that stage 1a actually trains. Previously
+#     stage 1 trained WITH attention and stage 2 rebuilt the model WITHOUT it; since
+#     init_from_ckpt uses strict=False, every attention weight was silently dropped.
+#   * cond_stage_config.ckpt_path ~ -> the stage-1b thermal VQ-VAE. cond_stage_trainable
+#     is false, so previously the thermal encoder was RANDOM AND FROZEN, i.e. the
+#     conditioning signal was random features. The paper requires a pretrained,
+#     then frozen, thermal encoder.
+#   * added top-level save_test_dir, which test.py requires (config['save_test_dir']).
+#   * gpus as a STRING (main.py calls .strip(",") on it).
+#   * 6 gpus x batch 7 = global batch 42, exactly the paper's batch size, and the
+#     scaled lr is 1*6*7*2.0e-06 = 8.4e-05, identical to the original 1*1*42*2.0e-06.
+# ---------------------------------------------------------------------------
+save_test_dir: outputs/ldm_baseline/test_images
+
+model:
+  base_learning_rate: 2.0e-06
+  target: ldm.models.diffusion.ddpm.LatentDiffusion
+  params:
+    linear_start: 0.0015
+    linear_end: 0.0195
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: vis_img
+    cond_stage_key: th_img
+    image_size: 16          # latent spatial size (128 / 8)
+    channels: 4             # latent channels (= embed_dim)
+    concat_mode: true       # -> conditioning_key 'concat'
+    cond_stage_trainable: false
+    monitor: val/loss_simple_ema
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 16
+        in_channels: 8      # 4 noisy latent + 4 thermal latent (concat)
+        out_channels: 4     # predicts eps in latent space
+        model_channels: 224
+        attention_resolutions: [8, 4, 2]
+        num_res_blocks: 2
+        channel_mult: [1, 2, 3, 4]
+        num_head_channels: 32
+
+    first_stage_config:
+      target: ldm.models.autoencoder.VQModelInterface
+      params:
+        embed_dim: 4
+        n_embed: 16384
+        ckpt_path: __STAGE1A_VIS_CKPT__
+        ddconfig:
+          double_z: false
+          z_channels: 4
+          resolution: 128
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 2, 4]
+          num_res_blocks: 2
+          attn_resolutions: [16]   # MUST match configs/difftv/vq_vis.yaml
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.th_encoder.TH_Encoder
+      params:
+        embed_dim: 4
+        n_embed: 16384
+        image_key: th_img
+        ckpt_path: __STAGE1B_TH_CKPT__   # thermal VQ-VAE; encoder.* + quant_conv.* are loaded
+        ddconfig:
+          double_z: false
+          z_channels: 4
+          resolution: 128
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [1, 2, 2, 4]
+          num_res_blocks: 2
+          attn_resolutions: [16]   # MUST match configs/difftv/vq_th.yaml
+          dropout: 0.0
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+    batch_size: 14
+    num_workers: 8
+    wrap: false
+    train:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/train/TH
+        vis_dir: data/thermal2visible_speakingfaces/train/VIS
+        in_size: 128
+    validation:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/test/TH
+        vis_dir: data/thermal2visible_speakingfaces/test/VIS
+        in_size: 128
+    test:
+      target: ldm.data.ldm_t2v.DatasetT2VLDM
+      params:
+        th_dir: data/thermal2visible_speakingfaces/test/TH
+        vis_dir: data/thermal2visible_speakingfaces/test/VIS
+        in_size: 128
+
+lightning:
+  callbacks:
+    image_logger:
+      target: main.ImageLogger
+      params:
+        batch_frequency: 5000
+        max_images: 8
+        increase_log_steps: false
+  trainer:
+    benchmark: true
+    gpus: "0,1,2"
+    max_epochs: 300
+    check_val_every_n_epoch: 5

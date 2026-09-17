@@ -1,0 +1,36 @@
+# DiffTV environment.
+#
+# NOTE: this differs from the original stable-diffusion environment on purpose.
+# The upstream pins (torch 1.11 / cu113, pytorch-lightning 1.4.2) do NOT run on
+# Ampere-successor GPUs such as H100 (sm_90) -- torch 1.11 has no sm_90 kernels, and
+# PL 1.4.2 is incompatible with torch 2.x. These pins are the oldest combination that
+# works on modern hardware while keeping the PL 1.x API the code is written against.
+name: difftv
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    # install torch matching YOUR cuda, e.g.
+    #   pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+    - torch==2.4.1
+    - torchvision==0.19.1
+    - pytorch-lightning==1.9.5   # last 1.x; 2.x removes the APIs this code uses
+    - torchmetrics==0.11.4
+    - setuptools<81              # PL 1.9.5 needs pkg_resources.declare_namespace
+    - numpy==1.26.4              # <2: the legacy code uses removed numpy aliases
+    - omegaconf==2.3.0
+    - einops==0.7.0
+    - opencv-python-headless==4.10.0.84
+    - albumentations==1.3.1
+    - kornia==0.7.3
+    - transformers==4.40.2
+    - imageio==2.34.2
+    - tensorboard
+    - tqdm
+    - scipy
+    - scikit-image               # PSNR / SSIM
+    - lpips==0.1.4               # LPIPS
+    - pytorch-fid==0.3.0         # FID
+    - taming-transformers-rom1504==0.0.6   # VQ perceptual loss + VectorQuantizer
