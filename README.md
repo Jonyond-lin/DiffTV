@@ -4,8 +4,6 @@ Implementation of **DiffTV: Identity-Preserved Thermal-to-Visible Face Translati
 
 Jingyu Lin, Guiqin Zhao, Jing Xu, Guoli Wang, Zejin Wang, Antitza Dantcheva, Lan Du, Cunjian Chen
 
----
-
 ## Pipeline
 
 | Stage | What it trains | Output |
@@ -16,8 +14,6 @@ Jingyu Lin, Guiqin Zhao, Jing Xu, Guoli Wang, Zejin Wang, Antitza Dantcheva, Lan
 | **3**  | ControlNet refinement on top of stage 2 | control branch only; base UNet stays frozen |
 
 Images are `128 x 128`. The autoencoder downsamples by **f = 8**, so the diffusion UNet operates on a `4 x 16 x 16` latent. Conditioning is **concatenation**: the thermal latent is concatenated to the noisy latent, giving the UNet `in_channels = 8` and `out_channels = 4`. There is no cross-attention and no text encoder anywhere in this model.
-
----
 
 ## Install
 
@@ -33,8 +29,6 @@ pip install -r requirements.txt
 Tested on PyTorch 2.4.1 / CUDA 12.1 / PyTorch-Lightning 1.9.5, Python 3.10, on NVIDIA H100.
 
 Stage 1 downloads the LPIPS perceptual-loss head (~7 KB) on first run, so it needs one-time internet access.
-
----
 
 ## Data
 
@@ -63,8 +57,6 @@ python scripts/prepare_data.py \
 
 The raw crops are **not** uniformly sized, so this rescaling step is required, not optional. `prepare_data.py` also strips the modality suffix so each pair shares one basename, verifies every TH file has a VIS partner, and reports how many sources were upscaled.
 
----
-
 ## Training
 
 Every stage is one command. Point `DATA_ROOT` at **your own** data directory.
@@ -91,8 +83,6 @@ Each stage auto-discovers the previous stage's checkpoint from `logs/`. Override
 bash scripts/train_stage2_ldm.sh lightning.trainer.max_epochs=50 data.params.batch_size=21
 ```
 
----
-
 ## Inference and metrics
 
 ```bash
@@ -101,8 +91,6 @@ STAGE=3 bash scripts/test.sh     # stage-3 ControlNet
 ```
 
 > **`BATCH` must divide the test-set size exactly.** `test_step` caches the first batch's size and reuses it to allocate the noise tensor, so a short final batch raises a shape error. The default `BATCH=42` divides 2268 (the SpeakingFaces test split) exactly; for the bundled 10-pair example use `BATCH=10`.
-
----
 
 ## Repository layout
 
@@ -115,8 +103,6 @@ examples/     tiny paired sample so the pipeline can be run immediately
 main.py       training entry point (all stages)
 test.py       inference entry point
 ```
-
----
 
 ## Citation
 
@@ -131,8 +117,6 @@ test.py       inference entry point
   doi       = {10.1145/3664647.3680635}
 }
 ```
-
----
 
 ## Acknowledgements and licence
 
